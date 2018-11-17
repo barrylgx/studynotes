@@ -1,0 +1,217 @@
+#+TITLE: linux内核network softirq 分析笔记
+#+AUTHOR: xielong(barrylgx)
+#+EMAIL:  barrylgx@163.com
+#+DESCRIPTION:
+#+KEYWORDS:
+#+LANGUAGE:  cn
+#+OPTIONS: ^:{}
+#+OPTIONS:   H:4 num:t toc:t \n:nil @:t ::t |:t ^:t -:t f:t *:t <:t
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="../orgstyle.css"/>
+
+本文针对内核的网络软中断进行说明. 内核源码版本为: 3.10.327
+
+* rps: softirq 中接收报文均衡分发
+  1. 在napi poll中调用接口 =netif_receive_skb= 向协议栈投递报文.
+     代码如下:
+     #+BEGIN_SRC c
+     int netif_receive_skb(struct sk_buff *skb)
+     {
+             int ret;
+
+             //....
+
+             rcu_read_lock();
+
+     #ifdef CONFIG_RPS
+             if (static_key_false(&rps_needed)) {
+             	struct rps_dev_flow voidflow, *rflow = &voidflow;
+             	int cpu = get_rps_cpu(skb->dev, skb, &rflow);//通过该函数选择分发到那个cpu
+
+             	if (cpu >= 0) {
+             		ret = enqueue_to_backlog(skb, cpu, &rflow->last_qtail);//insert到相应的cpu的积压队列中.
+             		rcu_read_unlock();
+             		return ret;
+             	}
+             }
+     #endif
+             ret = __netif_receive_skb(skb);//没有配置RPS, 直接调用该函数向协议栈投递报文.
+             rcu_read_unlock();
+             return ret;
+     }
+     #+END_SRC
+
+  2. 分发算法: =get_rps_cpu= 实现
+     待补充。
+
+
+* rps/rss/rfs 区别？
+  rss: receive side scaling
+  rps: receive packet steering
+  rfs: receive flow steering
+  rss: 是硬件nic实现的一个特性，根据一定的条件（特征值）对进入网卡
+  的流量分发到不同的接收队列中去； rss位于driver之下，可以看作是流
+  量进入driver之前的一个负载均衡器；
+
+  rps: 是软件实现的一个特性，也是根据一定的条件将frame分发到不同的
+  core上去；
+
+  rfs: 与rps位于同一个层次， 在driver之上，在分发流量时考虑了这个
+  流量是属于那个cpu正在处理的，然后将flow steering到这个cpu的queue
+  里面去；
+
+  总结： rss与rps是互斥的， 都用的就没有啥意义了。
+  rss 是硬件决定放到哪一个硬件队列上去；
+  rps 是软件从硬件队列上拿到frame后，决定放到那个cpu的backlog中去；
+  一个是分发到硬件队列； 一个是分发到软队列；
+
+
+* 报文接收处理
+  1. NAPI对硬件网卡有要求吗?
+     当然有要求. 最重要的要求是硬件网卡要支持对包的队列缓存.
+
+  2. NAPI下报文接收流程是什么?
+     + 驱动初始化时
+       在驱动初始化时, 要设置好 =poll= 回调, 该回调会由网卡软中断回调.
+
+     + 当发生硬件中断时
+       在硬件中断处理中, 要将该设备(=net_device=)通过
+       =__netif_rx_schedule(netdev)= 接口挂到 =softnet_data= 结构的
+       =poll_list= 链表中. 唤醒网络处理软中断.
+
+     + 在网络处理softirq中
+       遍历 =poll_list= 链表, 回调每个 =net_device= 设备注册的 poll 函
+       数, 在poll函数中, 将数据包从网卡的fifo存储skb, 然后通过
+       =netif_receive_skb= 接口提交给协议栈处理.
+
+  3. 如果硬件网卡不支持对包的队列缓存
+     硬件没有缓存, 那么只好软件帮缓存了, 所以内核设计了一个兼容的结构,
+     框架就是, 在硬件中断中调用 =netif_rx= 接口将报文存储在
+     =softnet_data= 的 =input_pkt_queue= 中, 然后唤醒网卡软中断. 然后
+     走与NAPI相同的流程, 但是在napi软中断的处理中会回调每个
+     =net_device= 的poll接口, 对于不支持napi的网卡, 其poll接口干的活与
+     支持napi的设备是不一样的, 支持napi的设备可以缓存数据包, 那么在
+     poll中就可以将缓存的数据包提交给协议栈处理了. 对于此处不支持napi
+     的设备, 因为在其硬件中断中我们已经通过 =netif_rx= 接口将报文存储
+     在 =input_pkt_queue= 字段中了, 那么此处poll时需要做的事情当然是从
+     =input_pkt_queue= 队列中读出报文提交给协议栈处理. 综上, 内核统一
+     将该poll的回调设置为:
+     : queue->backlog_dev.poll = process_backlog;
+
+     #+BEGIN_SRC c
+     struct softnet_data
+     {
+             struct net_device	*output_queue;
+             struct sk_buff_head	input_pkt_queue;//缓存不支持napi的设备的报文
+             struct list_head	poll_list;
+             struct sk_buff		*completion_queue;
+
+             struct net_device	backlog_dev;	/* Sorry. 8) */
+     #ifdef CONFIG_NET_DMA
+             struct dma_chan		*net_dma;
+     #endif
+     };
+
+     int netif_rx(struct sk_buff *skb)
+     {
+             struct softnet_data *queue;
+             unsigned long flags;
+             /*
+              * The code is rearranged so that the path is the most
+              * short when CPU is congested, but is still operating.
+              */
+             local_irq_save(flags);
+             queue = &__get_cpu_var(softnet_data);
+
+             __get_cpu_var(netdev_rx_stat).total++;
+             if (queue->input_pkt_queue.qlen <= netdev_max_backlog) {
+             	if (queue->input_pkt_queue.qlen) {
+     enqueue:
+             		dev_hold(skb->dev);
+             		__skb_queue_tail(&queue->input_pkt_queue, skb);
+             		local_irq_restore(flags);
+             		return NET_RX_SUCCESS;
+             	}
+
+             	netif_rx_schedule(&queue->backlog_dev);//唤醒软中断
+             	goto enqueue;
+             }
+
+             __get_cpu_var(netdev_rx_stat).dropped++;
+             local_irq_restore(flags);
+
+             kfree_skb(skb);
+             return NET_RX_DROP;
+     }
+     #+END_SRC
+
+  4. =netif_rx= 和 =netif_receive_skb= 区别?
+     通过上述说明, 我们也清楚的看到了这两个接口的区别.
+     =netif_receive_skb=: 将报文提交到协议栈; 可以在软中断中被调用
+     =netif_rx=: 将报文暂时放到 =input_pkt_queue= 队列中, 该接口可以在
+     硬件中断上下文中被调用.
+
+
+* sk_buff ops
+  1) head/end; data/tail; len/datalen
+     head/end: 线性区域的头和尾;
+     data/tail:当前有效数据报的头和尾；
+     len/datalen:当前线性数据区有效数据长度和非线性区有效数据长度
+  2) skb_shared_info frags[]/frag_list
+     skb_shared_info 就是管理非线性区域；
+     frags[]: 这个数组中每一项是一个page；用来实现iov；
+     frag_list:这个链表用来保存分片的报文；
+  3) ops
+     skb_put:  移动tail指针，增加payload数据
+     skb_push: 移动data指针，增加协议头
+     skb_pull: 移动data指针，剥去协议头
+     skb_reserve: 同时移动data和tail指针
+  4) pskb_copy/skb_copy
+     pskb_copy: 只拷贝sk_buff和线性区域数据
+     skb_copy:  拷贝sk_buff，线性区域数据和非线性区域数据
+
+
+* offload 有关的细节
+  1. 什么是 gro ?
+     gro 是对接收方向的一种优化；
+     没有gro时，当网卡收到数据包后，会将数据包直接递交给协议栈；
+     当有gro时，当网卡收到数据包后，会先将数据包进行收集，然后一次性递
+     交给协议栈，直观上看，减少了对协议栈路径的执行次数；
+  2. 什么是 tso/gso ?
+     tso/gso 是对发送方向的一种优化；
+     当没有tso/gso时，协议栈在发送数据时会根据mtu/mss将报文分片，然后
+     递交给网卡进行发送（对于tcp，计算根据mtu在tcp层就计算出mss， 然后
+     在tcp层就将报文按照mss进行封装了，所以每一个tcp报文都会包含tcp头
+     部信息的； 对于udp，分片的动作是放在了ip层， 所以每一个udp报文如
+     果被分片了，那么第一个报文包含udp头部信息，其它分片部分是不包含
+     udp头部信息的）；
+
+  3. 什么是 mtu ？
+     1) 1500
+        1500: The maximum payload in 802.3 ethernet is 1500 bytes.
+     2) 1518
+        The payload is encapsulated in an Ethernet Frame header (which
+        adds the Source/Destination MAC -12 bytes , Length 2, and CRC
+        4 Checksum. This is a total of 18 bytes of additional "stuff"
+        and frame size would be 1518 bytes
+     3) 1522
+        If you want to use vlan tagging then add 4 more bytes and then frame size would be 1522.
+     4) 1530
+        The Frame is transmitted over the wire -- before your Ethernet
+        card does that it basically stands up and shouts really loud
+        to make sure nobody else is using the wire (CSMA/CD) -- This
+        is the Preamble and Start-of-Frame delimiter (SFD) -- an
+        additional 8 bytes. now frame size would be 1530.
+     5) 1542
+        Finally when an ethernet transceiver is done sending a frame
+        it is required by 802.3 to transmit 12 bytes of silence
+        ("Interframe Gap") before it's allowed to send its next frame
+        and the frame size would be 1542.
+        Final frame with all fields is 1542 with vlan tagging and 1538
+        without vlan tagging.
+
+  4. 什么是 mss ？
+     1) mss = mtu - (iphdr + tcphdr)
+     2) MSS is specific to TCP
+     3) although UDP, using IP, can send a datagram larger than MTU.
+        It will be sent using IP fragmentation.  IP supports up to
+        64K.
