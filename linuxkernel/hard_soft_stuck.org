@@ -1,0 +1,126 @@
+#+TITLE: linux 内核hard/soft stuck detecte 分析笔记
+#+AUTHOR: xielong(barrylgx)
+#+EMAIL:  barrylgx@163.com
+#+DESCRIPTION:
+#+KEYWORDS:
+#+LANGUAGE:  cn
+#+OPTIONS: ^:{}
+#+OPTIONS:   H:4 num:t toc:t \n:nil @:t ::t |:t ^:t -:t f:t *:t <:t
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="../orgstyle.css"/>
+
+本文说明内核(版本3.10.327)的x86 arch下的watchdog实现.
+
+* 什么是pmu?
+  pmu: performance monitoring unit;
+  这个是cpu硬件提供的一个unit, 这个单元里面提供了很多个MSRs(计数器),
+  通过选择不同的性能监控的参数, 使用这些计数器进行技术统计, 这样就
+  能看到某个关注点的执行频率,热点.
+  针对一些常关注的点, pmu指定了专门的一些专门的event:
+     1. unhandled core cycles
+     2. instruction retired
+     3. unhandled reference cycles
+     4. LLC reference
+     5. LLC missed
+     6. branch instruction retired
+     7. branch missed
+     x86 arch下的pmu 内核中的数据结构为:
+     #+BEGIN_SRC c
+     /* struct x86_pmu - generic x86 pmu */
+     static struct pmu pmu = {
+         .pmu_enable		= x86_pmu_enable,
+         .pmu_disable		= x86_pmu_disable,
+
+         .attr_groups		= x86_pmu_attr_groups,
+
+         .event_init		= x86_pmu_event_init,
+
+         .add			= x86_pmu_add,
+         .del			= x86_pmu_del,
+         .start			= x86_pmu_start,
+         .stop			= x86_pmu_stop,
+         .read			= x86_pmu_read,
+
+         .start_txn		        = x86_pmu_start_txn,
+         .cancel_txn		= x86_pmu_cancel_txn,
+         .commit_txn		= x86_pmu_commit_txn,
+
+         .event_idx		        = x86_pmu_event_idx,
+         .sched_task		= x86_pmu_sched_task,
+         .task_ctx_size             = sizeof(struct x86_perf_task_context),
+     };
+     #+END_SRC
+
+
+* watchdog监控的原理?
+  1. 硬件中断 NMI irq
+     硬件支持: pmu; 申请一个可以产生NMI的pmu counter, 来按照设置的间隔
+     产生NMI irq, irq的回调函数为: =watchdog_overflow_callback=
+     =watchdog_overflow_callback= 完成如下处理:
+     + 判断 =watchdog_nmi_touch= 是否为true, 为true的话, 将
+       =watchdog_nmi_touch= 设置为false.
+
+     + 调用 =is_hardlockup()= 判断变量 =hrtimer_interrupts= 是否被
+       hrtimer定时器(实际是定时器中断)及时更新;
+
+     + 如果 =is_hardlockup()= 返回1, 那么再看变量
+       =hard_watchdog_warn= 的配置, 如果设置为ture(即:仅仅是警告一
+       下或者是之前已经处理过 hard watchdog stuck了), 那么直接退出,
+       不需要任何处理. 否则, 处理 hardlockup. 处理时又检查配置
+       =hardlockup_panic= , 该变量决定了出现 hardlockup 时, 是要
+       panic 还是 WARN.
+
+  2. =hrtimer_interrupts= 的更新
+     =hrtimer_interrupts= 由 =watchdog_hrtimer= 这个定时器更新, 该定时
+     器是一个 percpu 变量. 定时器的回调函数为: =watchdog_timer_fn= ,
+     下面分析该函数.
+     1) 调用 =watchdog_interrupt_count()= 递增 =hrtimer_interrupts= 这
+        个变量.
+
+     2) 通过 =wake_up_process= 唤醒 =softlockup_watchdog= 线程.
+
+     3) 调用 =is_softlockup()= 检查 soft stuck, 如果发现 soft stuck 了,
+        那么根据变量 =softlockup_panic= 的配置决定系统是否 panic.
+        =is_softlockup()= 检查关键变量 =watchdog_touch_ts= , 若该变量记
+        录的timestamp距离此刻的时间超过了 =get_softlockup_thresh()= (20s),
+        那么就认为当前cpu很长时间没有发生调度了(如果发生调度, watchdog
+        这么高优先级的线程一定会被调度执行一次, 一旦执行了, 那么
+        =watchdog_touch_ts= 变量就会被更新, 一旦更新, 那么距离此刻的时
+        间就不应该超过 =get_softlockup_thresh()= 设置的阈值了).
+
+  3. =watchdog_touch_ts= 的更新
+     该变量的更新由封装函数 =__touch_watchdog()= 来完成. 谁调用这个函
+     数呢? 当然是 watchdog 线程. watchdog 线程的配置如下:
+     #+BEGIN_SRC c
+     static struct smp_hotplug_thread watchdog_threads = {
+             .store			= &softlockup_watchdog,
+             .thread_should_run	        = watchdog_should_run,
+             .thread_fn 		= watchdog,
+             .thread_comm		= "watchdog/%u",
+             .setup			= watchdog_enable,
+             .cleanup	         	= watchdog_cleanup,
+             .park			= watchdog_disable,
+             .unpark			= watchdog_enable,
+     };
+     #+END_SRC
+
+  4. 总结
+     三个对象: NMI中断; hrtimer中断; watchdog线程;
+     NMI中断检查hrtimer中断是否正常工作;      ----> hard lock detect
+     hrtimer中断检查watchdog线程是否正常工作; ----> soft lock detect
+     时间间隔:
+     *NMI中断*: 10s
+     #+BEGIN_SRC c
+     u64 hw_nmi_get_sample_period(int watchdog_thresh)
+     {
+	return (u64)(cpu_khz) * 1000 * watchdog_thresh; /* 10s */
+     }
+     #+END_SRC
+     *hrtimer*: 4s(sample_period);
+     #+BEGIN_SRC c
+     sample_period = get_softlockup_thresh() * ((u64)NSEC_PER_SEC / 5);
+     static int get_softlockup_thresh(void)
+     {
+             return watchdog_thresh * 2;
+     }
+     #+END_SRC
+     *watchdog线程调度周期*: 约4s(watchdog线程由hrtimer的callback wakeup).
