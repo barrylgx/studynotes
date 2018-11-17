@@ -1,0 +1,87 @@
+#+TITLE: apic how to
+#+AUTHOR: barrylgx
+#+EMAIL:  barrylgx@163.com
+#+DESCRIPTION:
+#+KEYWORDS:
+#+LANGUAGE: en
+#+OPTIONS: \n:t ^:{} toc:t
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="../orgstyle.css"/>
+
+* lapic ioapic xapic x2apic 是什么及其引入的原因？
+  1) lapic
+     lapic: local apic, 这是intel针对mp系统而设计的一个中断控制器，
+     lapic模块每个logical processor有一个； 每个local APIC包括了一组
+     local APIC寄存器，用来控制local和external中断的产生，发送和接收，
+     也产生和发送IPI（处理器间的中断消息）。
+
+  2) ioapic
+     ioapic: ioapic位于system chip set， 该模块提供24个pin，每个pin可
+     以连接一个device，当该device发送的中断时，ioapic会根据事先的配置
+     （Redirection Table Entry）将中断format成一个message发送给lapic；
+     24个pin，每个pin对应一条Redirection table entry。
+     通过ioapic的功能，ioapic模块存在的理由就是为不支持msi类型的设备提
+     供中断路由和格式化。如果一个device本身就有msi capablity，那么就可
+     以不需要通过ioapic进行中断传递了。
+
+  3) apic/xapic/x2apic mode
+     |---------+--------------+---------------+------------+------------+--------|
+     | version | mode         | note          | MP         | bus        | access |
+     |---------+--------------+---------------+------------+------------+--------|
+     |       1 | 82489DX chip | external chip | single cpu | ?          | ioport |
+     |       2 | APIC         | APIC on chip  | SMP        | APIC bus   | mmio   |
+     |       3 | xAPIC        | APIC on chip  | SMP        | system bus | mmio   |
+     |       4 | x2APIC       | APIC on chip  | more SMP   | system bus | msr    |
+     |---------+--------------+---------------+------------+------------+--------|
+
+     + apic与xapic mode的差别：
+       apic mode下，lapic与io-apic通过APIC bus进行通信； 在xapic mode
+       下， lapic与io-apic通过system bus进行通信；
+     + xapic/x2apic mode的差别：
+       与xapic相比， x2apic架构可以支持更多的processors(primarily to
+       increase processor addressability.)
+     + xapic和x2apic模式下cpu访问方式不同；
+       xapic: mmio
+       x2apic: msr(RDMSR/WRMSR)
+     + 使用xapic还是x2apic?
+       indicated by CPUID.01H:ECX[21] = 1
+
+  4) 总结：
+     为了支持mp， 引入了lapic;
+     为了支持更多的proccessor，引入了x2apic;
+     为了支持没有msi capablity的device正常发送中断，引入了ioapic;
+
+
+* intel为中断虚拟化（local apic virtualize）提供了那些硬件支持？
+  vmm需要为vm访问lapic和ioapic提供虚拟化支持；lapic虚拟化vmx提供了一定
+  的硬件支持，ioapic目前是由软件模拟实现虚拟化的（qemu或者kvm中实现）；
+  根据vmm为vm模拟的chipset， vm可以根据模拟器的配置使用xapic或者2xapic
+  模式；intel针对这两种模式分别提供了不同的虚拟化支持。
+  总体来看，intel中断虚拟化架构如下：
+  #+BEGIN_EXAMPLE
+    +-------------------------------+
+    |VMX local APIC virtualize      |
+    |if virtual APIC access == 1    +---------+
+    |                               |         |
+    +-------------------------------+         +-----------------+
+                                              |  xAPIC mode     |
+                                              |                 +-------------+
+    +-------------------------------+         +-----------------+             |
+    |EPT violation fault            |         |                               |
+    |if virtual APIC access == 0    +---------+                               |
+    |                               |                                         |
+    +-------------------------------+                                  +------+-------------+
+                                                                       | local APIC         |
+                                                                       | virtual            |
+    +-------------------------------+                                  |                    |
+    |VMX local APIC virtualize      |                                  +------+-------------+
+    |if virtual 2xAPIC mode == 1    +--------+                                |
+    |                               |        |                                |
+    +-------------------------------+        +------------------+             |
+                                             |  2xAPIC mode     |             |
+                                             |                  +-------------+
+    +-------------------------------+        +------------------+
+    | MSR bitmap intecapt           |        |
+    | if virtual 2xAPIC mode == 0   +--------+
+    |                               |
+    +-------------------------------+
+  #+END_EXAMPLE
