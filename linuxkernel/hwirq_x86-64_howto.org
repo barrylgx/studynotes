@@ -1,0 +1,182 @@
+#+TITLE: linux x86_64 硬件中断
+#+AUTHOR: barrylgx
+#+EMAIL:  barrylgx@163.com
+#+DESCRIPTION:
+#+KEYWORDS:
+#+LANGUAGE: en
+#+OPTIONS: \n:t ^:{} toc:t @:t ::t |:t ^:t -:t f:t *:t <:t
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="../orgstyle.css"/>
+
+本文说明intel x86_64 架构下， linux如何处理与管理硬件中断；
+
+* softirq 处理
+  软中断可以看作是一种全局资源(每个cpu都可以执行软中断向量定义的回调函
+  数), 每个cpu都可以执行. 虽然软中断向量是全局的(不是percpu)的, 但是内
+  核定义了pending-percpu变量:
+  : #define local_softirq_pending()	this_cpu_read(irq_stat.__softirq_pending)
+  每次hardirq到来时只唤醒当前cpu的软中断(根据软中断的类别设置 =__softirq_pending=
+  相应的bit位, 当该cpu在执行软中断时先将 =__softirq_pending= 保存在
+  stack上,  清空 =__softirq_pending=, 然后遍历软中断向量执行各个回调.
+  1. =local_bh_disable= 的含义?
+     该函数的作用时, 当hardirq执行完成,在调用 =irq_exit= 返回时, 不要调
+     用 =invoke_softirq= 唤醒softirq. 下面我们具体分析其实现.
+     首先内核在每一个线程的 =thread_info= 结构中保存了 =preempt_count=
+     这个字段, 这个字段按照bit位定义, 有多种用途, 见下表:
+     |------------+------------------+------------+----------------+----------------+----------------|
+     | =reserver= | =PREEMPT_ACTIVE= | =NMI_MASK= | =hardirq_mask= | =softirq_mask= | =preempt_mask= |
+     |------------+------------------+------------+----------------+----------------+----------------|
+     |       0000 |                0 |          0 | 00 0000 0000   | 0000 0000      | 0000 0000      |
+     |------------+------------------+------------+----------------+----------------+----------------|
+     =local_bh_disable= 实际是递增 =softirq_mask= 表示的字段的值. 当
+     hardirq处理函数 =do_IRQ= 完成硬件中断的处理后, 会在返回时调用
+     =irq_exit=, 在该函数中会唤醒softirq, 代码片段如下:
+     #+BEGIN_SRC c
+     irq_exit()
+     if (!in_interrupt() && local_softirq_pending())
+	invoke_softirq(); //该函数中会调用 do_softirq.
+     #+END_SRC
+     可见, 唤醒软中断的前提条件有两个:
+     + 不在中断上下文;
+     + hardirq在处理时过程中置位了 =__softirq_pending=,
+     =in_interrupt()= 代码如下:
+     #+BEGIN_SRC c
+     #define in_interrupt()		(irq_count())
+     #define irq_count()	(preempt_count() & (HARDIRQ_MASK | SOFTIRQ_MASK \
+                                             | NMI_MASK))
+     #+END_SRC
+     从上述代码可以看出, =in_interrupt= 就是检查当前是否处于中断上下文
+     (包括hardirq和softirq), 那么,我们当前讨论的 =local_bh_disable= 会
+     增加 =softirq_mask= 字段的值, 那么, =in_interrupt= 会返回非零值,
+     所以 =invoke_softirq()= 即软中断自然就不会调用了.
+  2. 上述 =local_bh_disable= 实现中内核为什么使用线程 =thread_info= 的
+     字段, 而不用比如一个全局变量来定义???
+  3. 不同的cpu并发执行软中断的回调会不会有问题???
+     例如考虑:对于多队列网卡(假如只有两个队列), 一般情况下每个队列会对应一
+     个hardirq, 假如将这两个hardirq分别绑定到两个cpu上, 那么当两个队列
+     都收到数据时是如何保证同一个conntrack的流的处理的？这种情况只能考
+     rss了???
+
+
+* x86_64架构下idt表是per-cpu的吗？
+  idt表不是per-cpu的，但是idtr(idt寄存器，保存了interrupt descriptor table的物理地址)是per-cpu的。
+
+
+* idt表的index(vector)和irq number的关系？
+  + vector：此处就是指idt表中的index;
+  + irq number：这是系统范围内的全局中断编号，是我们通常说的外设的中断编号， 在:
+  : /proc/interrupts
+  中看到的第一列就是irq number;
+  + vector到irq number的映射关系保存在 vector_irq[]中， 这是一个per-cpu变量；
+
+
+* 外设的中断处理handler如何组织的？
+  系统会分配一个irq_desc结构, 该结构保存了具体外设的中断处理handler，
+  这个irq_desc结构会注册到irq_desc_tree或者irq_desc[]中；
+  : irq_to_desc(100)
+  通过这个函数可以找到irq number为100的外设的irq_desc， 这个结构中
+  保存了handler。
+
+
+* 外设的中断号irq number如何申请的？
+  比如对于ixgbe的网卡， 从pci的配置空间（或者bar）可以读取到需要的
+  中断数目nvectors， 然后ixgbe的驱动会请求系统给分配nvetors个中断，
+  这个是系统全局性的分配。
+  函数调用关系如下：
+  #+BEGIN_QUOTE
+  ixgbe_probe -> ixgbe_init_interrupt_scheme -> ixgbe_set_interrupt_capability
+  -> pci_enable_msi -> msi_capability_init -> native_setup_msi_irqs
+  -> irq_alloc_hwirq -> arch_setup_hwirq -> __assign_irq_vector
+  #+END_QUOTE
+  关键代码片段如下：
+  #+BEGIN_SRC c
+       /**
+        ,* alloc_desc(start + i, node, owner);
+        ,* irq_insert_desc -> radix_tree_insert
+        ,*/
+       static DECLARE_BITMAP(allocated_irqs, IRQ_BITMAP_BITS);
+
+       /**
+        ,* irq_alloc_hwirqs -> arch_setup_hwirq -> __assign_irq_vector
+        ,* irq为系统为外设分配的中断号， 这个中断号可以通过/proc/interrupts看到的；
+        ,* 这个函数具体的功能就是在per-cpu的idt表中分配出一个未用的vector，用来处理这个外设中断；
+        ,* 分配的时候需要考虑当前online的cpu，当前未设置affinity的cpu，综合这些因素来分配；
+        ,*/
+       static int
+       __assign_irq_vector(int irq, struct irq_cfg *cfg, const struct cpumask *mask);
+
+       /**
+        ,* 对于支持msi的pci设备， 上述的irq分配成功后，会通过下面的函数生成msi_msg
+        ,*/
+       static int msi_compose_msg(struct pci_dev *pdev, unsigned int irq,
+                                  struct msi_msg *msg, u8 hpet_id)
+       {
+           struct irq_cfg *cfg;
+           int err;
+           unsigned dest;
+
+           cfg = irq_cfg(irq);
+           /* 这个函数中会从某一个cpu的vector_irq[]中分配一个vector， 然后保存在cfg中 */
+           err = assign_irq_vector(irq, cfg, apic->target_cpus());
+           if (err)
+               return err;
+
+           err = apic->cpu_mask_to_apicid_and(cfg->domain,
+                                              apic->target_cpus(), &dest);
+           if (err)
+               return err;
+
+           /* 这个函数会compose一个msi msg， 填充好address 和 data， data中填入了 cfg->vector */
+           x86_msi.compose_msi_msg(pdev, irq, dest, msg, hpet_id);
+
+           return 0;
+       }
+  #+END_SRC
+
+
+* 外设如何注册中断？
+  #+BEGIN_EXAMPLE
+       err = request_irq(entry->vector, &ixgbe_msix_clean_rings, 0,
+                                         q_vector->name, q_vector);
+  #+END_EXAMPLE
+  将中断号及其handler注册到irq_desc中。
+  这个过程具体如下：
+  + 分配irq_desc, 以irq_number为索引，注册到irq_desc_tree或者irq_desc[]中；
+  + 根据irq affinity的配置，在某一个cpu的vector_irq[]中找到一个未用的vector, 将该irq number设置到vector_irq[]中，这样建立起vector到irq的映射关系；
+  + 根据分配好的vector， 设置好apic或pci设备msi硬件模块；
+
+
+* 外设产生中断后的处理流程？
+  1) lapci根据lvt或msi的设置，这里面已经包含了vector和target cpu等信息，lapci将中断提交给target cpu,
+  2) target cpu处理中断， cpu从总线读取到vector后，根据该vector索引到idt表中的entry， 这个entry既有到gdt表的索引，也包含了handler的offset;
+  3) 然后cpu将rip指向handler入口，开始软件部分的处理。
+  #+BEGIN_SRC c
+       /**
+        ,* 这段汇编代码将.data和.text的内容揉到一起了， 将.text段的内容抽出来如下：
+        ,* 这个interrupt中数据格式如下：
+        ,* pushq_cfi $(~32+0x80)  jmp common_interrupt
+        ,* pushq_cfi $(~33+0x80)  jmp common_interrupt
+        ,* pushq_cfi $(~34+0x80)  jmp common_interrupt
+        ,* ...
+        ,* pushq_cfi $(~240+0x80)  jmp common_interrupt
+        ,* used_vectors中，从32开始，未注册的都注册为上述的代码；
+        ,*/
+       set_intr_gate(i, interrupt[i - FIRST_EXTERNAL_VECTOR]);
+  #+END_SRC
+  + 在 common_interrupt 中， 将vector保存在栈顶， 然后调用 do_IRQ;
+  + 在 do_IRQ 中，从当前cpu的 vector_irq中查找到irq number； 然后调用handle_irq
+  + 在 handle_irq中， 使用 irq_to_desc(irq) 查找到 irq_desc; 然后调用request_irq注册的handler
+
+
+* 总结与思考
+  + x86_64架构下， idt表只有256个中断vector， 这是一个限制，为什么只有
+    256个中断vector可用呢？ 是为了兼容？；
+  + 此外， 虽然idtr寄存器是per-cpu的， 但是linux并没有创建per-cpu的idt
+    表来管理中断；而是用了全局的一张表idt，这样，所有的cpu看到的中断向
+    量都是一样的；如果外设的irq number与idt的vector一一对应， 那么系统
+    只能支持256个中断， 显然这是不够用的，所以linux的做法是软件自己维
+    护了一个per-cpu的vector_irq[]；驱动在申请中断资源时根据affinity及
+    其onlinecpu约束条件查询到某一个cpu上未用的vector，然后使用该vector
+    配置好apic；这样达到了一个效果：虽然idt表项有限（256），但是考虑有
+    64个cpu的系统，可以支持的最大外设中断的数目为：
+    : 64x(256-32-1-15)=13312个(32个系统保留的exception/traps; 1个syscall； 15个系统保留IPI？？？)；
+    这个数目目前应该是充足的；
