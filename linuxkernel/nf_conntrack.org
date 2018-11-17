@@ -1,0 +1,540 @@
+#+TITLE: linux内核 netfilter+conntrack+nat 分析笔记
+#+AUTHOR: xielong(barrylgx)
+#+EMAIL:  barrylgx@163.com
+#+DESCRIPTION:
+#+KEYWORDS:
+#+LANGUAGE:  cn
+#+OPTIONS: ^:{}
+#+OPTIONS:   H:4 num:t toc:t \n:nil @:t ::t |:t ^:t -:t f:t *:t <:t
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="../orgstyle.css"/>
+
+本文说明内核(版本3.10.327) =netfilter= 框架下的 =conntrack= 和 =nat= 模块的实现机
+制.
+
+* 一些概念及其问题
+   1. =iptables= 和 =netfilter= 关系? \\
+      =iptable= 是用户态的一个工具, 实现了用户命令行接口和与内核的接口.\\
+      将用户在命令行下设定的规则转化为内核可以识别的格式然后下发给内\\
+      核.内核将接收到的规则信息存储在指定的表的规则中.\\
+   2. =iptables= 的规则是怎么组织的? \\
+      表结构和规则组织在一起, =ipt_table= 是一个表, 其字段 =private= 指向了\\
+      =ipt_table_info=, 这个数据结构包含了表的规则信息, 每条规则使用数\\
+      据结构 =ipt_entry + ipt_entry_match + ipt_entry_target= 表示.\\
+      =ipt_table_info= 将这些数据结构分配在了连续的内存中, 通过适当的组\\
+      织, 可以方便遍历 =match= 和 =target=.
+   3. =iptables= 的规则什么时候用到?\\
+      当数据包经过 =hook= 点的时候, 在 =hook= 点的回调中会去查找各个表注册的\\
+      规则, 然后进行处理.
+   4. =iptables= 的规则怎么用的?\\
+      内核使用 =ip_entry= 定义一条规则, 如果有扩展,那么规则里面包含了还包\\
+      含了 =match= 和 =target=, =match= 用来做匹配, =target= 可以看作
+      是 =action=.
+   5. =netfilter= 的 =hook= 点是怎么组织的?\\
+      通过一个二维结构将不同的协议族的 =hook= 点组织起来, 每个 =hook= 点挂接\\
+      的回调通过链表连接起来.数据结构见 =nf_hooks[family][NF_HOOKS]=;\\
+   6. =netfilter= 的 =hook= 点的回调调用顺序是什么?\\
+      由优先级确定,  =hook= 点的链是有优先级的.
+   7. 为什么要有 =conntrack?= =conntrack= 与 =nat= 的关系?\\
+      =conntrack= 可以看作是基础, 有了 =conntrack=, =nat= 处理起来就会比较高效,除\\
+      了第一包需要查找 =nat= 表, 然后 =conntrack= 记录了 =nat= 信息, 后续的包匹配\\
+      到 =conntrack= 后在 =nat-hook= 点回调中直接就可以做 =nat= 了, 不需要再次去查\\
+      询 =nat_table= 规则表了.
+   8. 何时真正的修正了报文?\\
+      =nat= 表中的规则 =target= 只是修改了 =conntrack= 的信息, 并没有修改报文,\\
+      报文的修正放到了 =nat= 注册的 =hook= 中去处理了.
+   9. =nat= 过程:\\
+      第一个包进入的时候 =conntrack= 模块 =nat_info= 字段没有初始化, 状态为:\\
+      =IP_CT_NEW=, 所以当到了 =nat= 的 =hook= 回调中, 需要通过 =ip_nat_rule_find=\\
+      对 =conntrack= 的 =nat_info= 字段进行初始化(具体就是在 =nat_table= 中查找规\\
+      则 =ip_entry, match/target=, 将 =conntrack= 放入到 =nat= 的 =hash= 表中), 然后\\
+      进行 =do_bingings=, 在这里面调用 =manip_pkt= 完成报文的修\\
+      正.( =manip_pkt= 中会再次调用4层协议的 =manip_pkt= 回调, 根据不同的四层\\
+      协议再次进行报文修正, 这样,最终完成了报文的处理, 当然如果需要\\
+      =helper= 那么还需要通过 =helper->help= 再次修正报文).\\
+      总结就是: =conntrack= 完成流的记录, 并在 =skb= 中打上标签, 然后后续的\\
+      =chain= 中的 =hook= 回调可以借助 =conntrack= 完成一些特定的事情.
+   10. conntrack 表如何组织?
+       一个conntrack包含两个方向的流, 这两个方向的流(=tuple_hash_node=)保\\
+       存在一张全局hash表中, 当根据报文的flow_key查找时, 匹配到一个方向的\\
+       tuple, 那么也同时找到了另一个方向的tuple, 因为这两个tuple是组织在一\\
+       个 =nf_conn= 结构中的.
+   11. linux conntrack 表是否有锁?\\
+       当前的内核实现是由锁保护的, 原因有如下:\\
+       + 当前的conntrack表在网络命名空间是全局的.\\
+         参见: =net->net_ct=, 可以看作是全局一张表, 由所有cpu共享. 并
+         不是percpu的.
+       + 其次, netfilter框架没有办法保证多队列的网卡将具有相同特征的流\\
+         hash到特定的cpu上进行处理.\\
+         对于该问题, 虽然内核在网络接收softirq中通过RPS,RFS模块可以将\\
+         流进行一定程度的均衡分发, 但是鉴于nat的特殊性, 一个流的两个方\\
+         向的报文的flow_key是不同的, 所以也无法做到将一个流的两个方向\\
+         的报文hash到同一个cpu上.\\
+         对于支持RSS高级特性的网卡, 由于上述的原因,同样无法做到.\\
+   12. 有些协议需要特殊的修正(比如ftp), conntrack模块怎么组织和处理的?\\
+       + contrack模块如何组织:\\
+         =nf_conn= 结构包含了一个字段 *ext, 这个字段存储了针对\\
+         conntrack模块的扩展, 这些扩展中最重要的一个就是 helper 扩展,\\
+         这个helper扩展包含了contrack时需要额外处理的工作.
+
+
+* =conntrack= 的实现
+  在模块 =nf_conntrack_l3proto_ipv4.c= 中实现.\\
+  在全局变量 =ipv4_conntrack_ops= 中定义了 =hook= 点的 =callback=, 然后在模块\\
+  初始化( =nf_conntrack_l3proto_ipv4_init= )中使用 =nf_register_hook= 完成\\
+  注册. =hook= 点的回调如下:
+  |----------------------------+------------------------+----------------------------------------------------------|
+  | callback                   | hook point             | priority                                                 |
+  |----------------------------+------------------------+----------------------------------------------------------|
+  | =ipv4_conntrack_in=        | =NF_INET_PRE_ROUTING=  | =NF_IP_PRI_CONNTRACK=                                    |
+  | =ipv4_confirm/ipv4_helper= | =NF_INET_POST_ROUTING= | =NF_IP_PRI_CONNTRACK_CONFIRM/NF_IP_PRI_CONNTRACK_HELPER= |
+  | =ipv4_conntrack_local=     | =NF_INET_LOCAL_OUT=    | =NF_IP_PRI_CONNTRACK=                                    |
+  | =ipv4_confirm/ipv4_helper= | =NF_INET_LOCAL_IN=     | =NF_IP_PRI_CONNTRACK_CONFIRM/NF_IP_PRI_CONNTRACK_HELPER= |
+  |----------------------------+------------------------+----------------------------------------------------------|
+** =ipv4_conntrack_in=
+   调用链:
+   #+BEGIN_EXAMPLE
+      ipv4_conntrack_in -> nf_conntrack_in -> l3proto = __nf_ct_l3proto_find(pf);
+      l3proto->get_l4proto(&dataoff)       -> l4proto = __nf_ct_l4proto_find(pf, protonum);
+      l4proto->error()                     -> ct = resolve_normal_ct()
+      timeouts = nf_ct_timeout_lookup(net, ct, l4proto);
+      l4proto->packet(ct, skb, dataoff, ctinfo, pf, hooknum, timeouts);
+      if (set_reply && !test_and_set_bit(IPS_SEEN_REPLY_BIT, &ct->status))
+   #+END_EXAMPLE
+   =nf_conntrack_in= 需要干的活有如下:
+   1) 检查 =skb->nfct= 字段, 如果非空, 说明 =skb= 已经被 =conntracked=,再看如\\
+      果 =conntrack= 不是 =templete conntrack=, 那么就不需要做任何事情了,\\
+      直接 =NF_ACCEPT=.
+
+   2) 根据3层协议的回调 =ipv4_get_l4proto= 找到4层协议头在 =skb= 中的\\
+      =offset=, 同时解析出具体的四层协议. 此外此处还检查 =ip= 头部的分片\\
+      字段, 如果是分片包, 返回 *=-NF_ACCEPT=*.
+
+   3) 根据4层协议 =protonum= 找到4层协议处理 =handler=, 然后使用4层协议\\
+      =error= (以 =upd= 为例: ~udp_error~)回调检查包: 检查包的长度是否合理,\\
+      是否是 =truncated/malformed= 的包, 根据条件检查4层 =checksum=.如果\\
+      检查通过返回: =NF_ACCEPT=.
+
+   4) =resolve_normal_ct=: 执行到此处, 说明该 =skb= 还未被 =conntracked=,\\
+      于是调用该函数完成对包的 =conntracked=, 并返回 =conntrack ptr=.\\
+      + 通过 =nf_ct_get_tuple= 构建 =nf_conntrack_tuple=.
+      + 计算 =hash= 值, 在哈希表中查找看是否已经存在一个 =tuple=.如果不存
+        通过 =init_conntrack= 一个 =nf_conntrack_tuple_hash=
+      + 检查 =nf_conntrack_tuple_hash= 的方向,
+        如果是: =IP_CT_DIR_REPLY=: 设置 =ctinfo= 为:
+        =IP_CT_ESTABLISHED_REPLY, set_reply = 1;=\\
+        否则:检查 =ct->status=,
+        |-----------+----------------------+---------------------+-------------|
+        | ct-status | check-bit            | ctinfo              | =set_reply= |
+        |-----------+----------------------+---------------------+-------------|
+        |           | =IPS_SEEN_REPLY_BIT= | =IP_CT_ESTABLISHED= |           0 |
+        |           | =IPS_EXPECTED_BIT=   | =IP_CT_RELATED=     |           0 |
+        |           | other case           | =IP_CT_NEW=         |           0 |
+        |-----------+----------------------+---------------------+-------------|
+        我们当前的情况为 =IP_CT_NEW=.
+      + 设置 =skb->nfct = &ct->ct_general=; =skb->nfctinfo = *ctinfo=;
+      + 返回 =ct=;
+      + 备注:
+        - 计算 =hash= 的方法?\\
+          #+BEGIN_EXAMPLE
+          hash_conntrack_raw: jhash2
+          address:  tuple;
+          length:   sizeof(struct(tuple->src) + sizeof(tuple->dst.u3)) / sizeof(u32)
+          initvalue:zone ^ nf_conntrack_hash_rnd ^(((__force __u16)tuple->dst.u.all << 16) |tuple->dst.protonum)
+          #+END_EXAMPLE
+        - 查找那个哈希表?\\
+          =net->ct->hash[]=; 该哈希表存储在 =net= 结构里面的
+          =netns_ct= 结构中. 大小在 =conntrack= 模块初始化时根据内存的大小进行了设置.
+        - 那些字段作为key? 如何比较?\\
+          #+BEGIN_EXAMPLE
+          nf_conntrack_tuple.src: ip, port, l3num(3层协议号)
+          nf_conntrack_tuple.dst: ip, port, protonum, dir
+          __nf_ct_tuple_src_equal(t1, t2)
+          __nf_ct_tuple_dst_equal(t1, t2): 注意dir不会参与比较!!!.
+          #+END_EXAMPLE
+        - =init_conntrack= 如何创建一个新的 =tuple_hash=?\\
+          首先:根据传入的 =tuple= 构建 =invert_tuple=;\\
+          然后:根据 =orgin_tuple= 和 =invert_tuple= 分配 =nf_conn= ,将\\
+          =tuple= 赋值给: =ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple= 和\\
+          =ct->tuplehash[IP_CT_DIR_REPLY].tuple=, 设置 =ct= 的\\
+          =timeout= 超时定时器: 回调为: =death_by_timeout=.
+          #+BEGIN_SRC c
+          /* save hash for reusing when confirming */
+          *(unsigned long*)(&ct->tuplehash[IP_CT_DIR_REPLY].hnnode.pprev) = hash;
+          #+END_SRC
+          为了减少一次 =hash= 计算, 此处 =replay tuple= 记住 =origintuple= 计算出来的 =hash= 值以备后面使用.\\
+          最后:这个函数返回 =nf_conn= 里面内嵌的 =tuple(&ct->tuplehash[IP_CT_DIR_ORIGINAL])=
+
+   5) =timerout: nf_ct_timeout_lookup()=
+
+   6) =l4proto->packet()= (=udp= 为例: =udp_packet=)
+      如果 =ct->status= 设置了 =IPS_SEEN_REPLY_BIT=,
+      #+BEGIN_SRC c
+      nf_ct_refresh_acct(ct, ctinfo, skb, timeouts[UDP_CT_REPLIED]);
+      /* Also, more likely to be important, and not a probe */
+      if (!test_and_set_bit(IPS_ASSURED_BIT, &ct->status))
+              nf_conntrack_event_cache(IPCT_ASSURED, ct);
+      #+END_SRC
+      否则:
+      #+BEGIN_SRC c
+      nf_ct_refresh_acct(ct, ctinfo, skb, timeouts[UDP_CT_UNREPLIED]);
+      #+END_SRC
+
+   7) =ct->status=
+      如果设置了 =set_reply=, 则: =test_and_set_bit(IPS_SEEN_REPLY_BIT, &ct->status)=
+
+** =ipv4_confirm=
+   获取到 =nf_conn: nf_ct_get()=, 调用 =nf_conntrack_confirm=;\\
+   判断 =ct= 有效且 =IPS_UNTRACKED_BIT= 还未置位且 =ct= 还未得到 =confirm=, 继续调用\\
+   =__nf_conntrack_confirm=, 该函数确认 =connnection=, 并将 =nf_conn= 插入\\
+   =hast-table=.
+   1. 如果 =CTINFO2DIR(ctinfo)= 不是 =IP_CT_DIR_ORIGINAL=, 退出.
+   2. 从 =hash= 表中查找 =tuple=, 看 =hash= 表中是否已经存在了. 存在的话,直接退
+      出.如果不存在,继续.
+   3. =nf_ct_del_from_dying_or_unconfirmed_list(ct)=;
+   4. 修改 =ct->timeout.expires=, 启动 =timer=.
+   5. 设置 =ct= 的状态为 =IPS_CONFIRMED=.
+   6. 将 =ct= 插入 =hash= 表: =__nf_conntrack_hash_insert(ct, hash,reply_hash)=;
+      注意: 这一个调用实际插入了两个 =node= , 一个 =original= ,一个 =reply=.
+   7. =event_cache= 处理
+      #+BEGIN_SRC c
+      nf_conntrack_event_cache(master_ct(ct) ? IPCT_RELATED : IPCT_NEW, ct);
+      #+END_SRC
+
+** =connnection= 表的锁
+   在前面[[*%E4%B8%80%E4%BA%9B%E6%A6%82%E5%BF%B5%E5%8F%8A%E5%85%B6%E9%97%AE%E9%A2%98][一些概念及其问题]]已经提到, 内核使用了spinlock保证了conntrack表\\
+   的完整性, 但是内核并没有使用一把全局锁进行粗粒度的操作, 相反, 内核\\
+   为了减少锁的影响, 尽可能是锁的粒度较小, 下面说明内核的实现机制.\\
+   #+BEGIN_SRC c
+   static bool nf_conntrack_double_lock(struct net *net, unsigned int h1,
+				     unsigned int h2, unsigned int sequence)
+   {
+	h1 %= CONNTRACK_LOCKS;
+	h2 %= CONNTRACK_LOCKS;
+        //下面的代码保证了在申请锁时,先申请下标较小的锁, 这样可以避免死锁.
+	if (h1 <= h2) {
+		spin_lock(&nf_conntrack_locks[h1]);
+		if (h1 != h2)
+			spin_lock_nested(&nf_conntrack_locks[h2],
+					 SINGLE_DEPTH_NESTING);
+	} else {
+		spin_lock(&nf_conntrack_locks[h2]);
+		spin_lock_nested(&nf_conntrack_locks[h1],
+				 SINGLE_DEPTH_NESTING);
+	}
+        //下面是针对hash大小发生变化时的处理.
+	if (read_seqcount_retry(&net->ct.generation, sequence)) {
+		nf_conntrack_double_unlock(h1, h2);
+		return true;
+	}
+	return false;
+   }
+   static void nf_conntrack_double_unlock(unsigned int h1, unsigned int h2)
+   {
+           h1 %= CONNTRACK_LOCKS;
+           h2 %= CONNTRACK_LOCKS;
+           //释放就无所谓了.
+           spin_unlock(&nf_conntrack_locks[h1]);
+           if (h1 != h2)
+           	spin_unlock(&nf_conntrack_locks[h2]);
+   }
+   #+END_SRC
+   内核设计了一个装满锁的池子, 定义见:\\
+   : __cacheline_aligned_in_smp spinlock_t nf_conntrack_locks[CONNTRACK_LOCKS];
+   每当需要申请锁的时候, 就从池子里面找一个出来, 怎么找? 拿tuple的hash\\
+   值再hash一把即可. 然后加锁. 注意加锁时要保证顺序, 防止死锁.\\
+   此外, 这么设计的原因还在于内核支持动态的调整hash表的大小. 所以不可\\
+   能使用在hash表头嵌入链表锁的方式实现.
+
+
+* =nat= 的实现
+  在模块 =iptable_nat.c= 中实现.
+  在全局变量 =nf_nat_ipv4_ops= 中定义了 =hook= 点的 =callback=. 然后在模块初\\
+  始化(=iptable_nat_init=)中使用 =nf_register_hook= 完成注册. =hook= 点的回\\
+  调如下:
+  |-----------------------------+------------------------+---------------------|
+  | callback                    | hook point             | priority            |
+  |-----------------------------+------------------------+---------------------|
+  | =iptable_nat_ipv4_in=       | =NF_INET_PRE_ROUTING=  | =NF_IP_PRI_NAT_DST= |
+  | =iptable_nat_ipv4_out=      | =NF_INET_POST_ROUTING= | =NF_IP_PRI_NAT_SRC= |
+  | =iptable_nat_ipv4_local_fn= | =NF_INET_LOCAL_OUT=    | =NF_IP_PRI_NAT_DST= |
+  | =iptable_nat_ipv4_fn=       | =NF_INET_LOCAL_IN=     | =NF_IP_PRI_NAT_SRC= |
+  |-----------------------------+------------------------+---------------------|
+  #+BEGIN_SRC c
+  struct list_head nf_hooks[NFPROTO_NUMPROTO][NF_MAX_HOOKS] __read_mostly;
+  #+END_SRC
+  上述的 =hookcallback= 就注册在 =nf_hooks= 这个二维结构中了.
+
+
+* 关于 =helper=
+  1. helper 是用来干什么的? 如何组织保存?
+     conntrack使用的全局hashtable: =nf_ct_helper_hash=
+     注册接口: =nf_conntrack_helper_register=
+     查询接口:
+     : __nf_ct_helper_find(tuple)
+     : __nf_conntrack_helper_find(name, l3num, protonum)
+
+     见ftp注册helper代码片段:
+     : nf_conntrack_tftp_init[139]    ret = nf_conntrack_helper_register(&tftp[i][j]);
+
+  2. helper 什么时候绑定到 =nf_conn=?
+     在 =init_conntrack= 中进行绑定. 关键代码如下:
+     #+BEGIN_SRC c
+	if (net->ct.expect_count) { //检查excpect表中是否有元素, 进入该分支说明存在期望的连接.
+		spin_lock(&nf_conntrack_expect_lock);
+		exp = nf_ct_find_expectation(net, zone, tuple);//根据tuple找到 exp
+		if (exp) {
+			pr_debug("conntrack: expectation arrives ct=%p exp=%p\n",
+				 ct, exp);
+			/* Welcome, Mr. Bond.  We've been expecting you... */
+			__set_bit(IPS_EXPECTED_BIT, &ct->status); //设置ct状态
+			/* exp->master safe, refcnt bumped in nf_ct_find_expectation */
+			ct->master = exp->master;//当前ct与exp共用一个master.
+			if (exp->helper) {
+				help = nf_ct_helper_ext_add(ct, exp->helper,
+							    GFP_ATOMIC);
+				if (help)
+					rcu_assign_pointer(help->helper, exp->helper);
+			}
+
+#ifdef CONFIG_NF_CONNTRACK_MARK
+			ct->mark = exp->master->mark;
+#endif
+#ifdef CONFIG_NF_CONNTRACK_SECMARK
+			ct->secmark = exp->master->secmark;
+#endif
+			NF_CT_STAT_INC(net, expect_new);
+		}
+		spin_unlock(&nf_conntrack_expect_lock);
+	}
+	if (!exp) { //如果上述没有找到exp, 那么进入该分支
+		__nf_ct_try_assign_helper(ct, tmpl, GFP_ATOMIC); //此处tmpl是null, 调用该函数绑定helper
+		NF_CT_STAT_INC(net, new);
+	}
+     #+END_SRC
+
+     =__nf_ct_try_assign_helper= 关键代码如下:
+     #+BEGIN_SRC c
+     int __nf_ct_try_assign_helper(struct nf_conn *ct, struct nf_conn *tmpl,
+             		      gfp_t flags)
+     {
+             struct nf_conntrack_helper *helper = NULL;
+             struct nf_conn_help *help;
+             struct net *net = nf_ct_net(ct);
+             int ret = 0;
+
+             /* We already got a helper explicitly attached. The function
+              * nf_conntrack_alter_reply - in case NAT is in use - asks for looking
+              * the helper up again. Since now the user is in full control of
+              * making consistent helper configurations, skip this automatic
+              * re-lookup, otherwise we'll lose the helper.
+              */
+             if (test_bit(IPS_HELPER_BIT, &ct->status))
+             	return 0;
+
+             /* ... */
+             help = nfct_help(ct);
+             if (net->ct.sysctl_auto_assign_helper && helper == NULL) //这个条件满足
+             	helper = __nf_ct_helper_find(&ct->tuplehash[IP_CT_DIR_REPLY].tuple);//使用这个tuple找到一个之前注册的helper,
+
+             /* 如果没有找到, 无法绑定, 直接退出 */
+             if (helper == NULL) {
+             	if (help)
+             		RCU_INIT_POINTER(help->helper, NULL);
+             	goto out;
+             }
+             /* ct中当前的help为null, 所以此处通过 nf_ct_helper_ext_add 创建help, 这个help保存在 ct的ext字段指向的内存中. */
+             if (help == NULL) {
+             	help = nf_ct_helper_ext_add(ct, helper, flags);
+             	if (help == NULL) {
+             		ret = -ENOMEM;
+             		goto out;
+             	}
+             } else {
+             	/* We only allow helper re-assignment of the same sort since
+             	 * we cannot reallocate the helper extension area.
+             	 */
+             	struct nf_conntrack_helper *tmp = rcu_dereference(help->helper);
+
+             	if (tmp && tmp->help != helper->help) {
+             		RCU_INIT_POINTER(help->helper, NULL);
+             		goto out;
+             	}
+             }
+             /* 将ct中的help的字段helper绑定到 该helper. */
+             rcu_assign_pointer(help->helper, helper);
+     out:
+             return ret;
+     }
+     #+END_SRC
+
+  3. helper 什么时候回调到?
+     在conntrack的 =ipv4_helper= 阶段调用, 在这个函数中会创建 expect,
+     见如下说明.
+
+  4. expect 是什么? 如何组织?
+     在conntrack模块的POSTROUTING阶段, 具体hook点函数为: =ipv4_helper=:
+     在该函数中创建了 expect, 并将该 expect insert到 =net_ct=
+     hashtable 中, 同时将 expect 链接到了 master_help->expectations.
+     涉及的关键函数有如下:
+      #+BEGIN_EXAMPLE
+      ipv4_helper
+      help = nfct_help(ct);
+      helper = rcu_dereference(help->helper);
+      helper->help: 例如: nf_conntrack_ftp.c/help():
+      exp = nf_ct_expect_alloc(ct);
+      nf_ct_expect_init()
+      nf_ct_expect_related(exp)
+      ret = nf_ct_expect_insert(expect);
+      hlist_add_head(&exp->lnode, &master_help->expectations);
+      master_help->expecting[exp->class]++;
+      hlist_add_head_rcu(&exp->hnode, &net->ct.expect_hash[h]);
+      net->ct.expect_count++;
+      #+END_EXAMPLE
+
+
+* 针对SNAT的场景: 描述 =walk-through conntrack+nat= 流程.
+  首先报文进入 =NF_INET_PRE_ROUTING= 处理, 然后查路由, 然后再进入\\
+  =NF_INET_POST_ROUTING= 处理, 最后输出封包. 所以,下面针对这种场景, 我\\
+  们分析 =linux= 内核 =pre_routing, post_routing= 点上 =conntrack= 和\\
+  =nat= 处理流程.
+
+  1. 当收到第一个封包时(=NF_INET_PRE_ROUTING=):
+     1) =ipv4_conntrack_in= 处理:\\
+        创建 =nf_conn=, 保存到 =skb->nfct= 中, 但是还没有 =insert= 到
+        =net-ct.hash= 表中. 设置 =skb->nfctinfo = IP_CT_NEW=;
+        =ct->status= 设置为0???
+     2) =iptable_nat_ipv4_in= -> =nf_nat_ipv4_in= -> =nf_nat_ipv4_fn= 处理:\\
+        + 确认操作类型 =maniptype: 1=(hook点既不是 =post_routing= 也不是 =local_output=)
+        + 确认包没有分片
+        + 确认skb已经被tracked
+        + 获取或创建 =nf_conn= 中的nat扩展字段 =nf_conn= 记录了nat信息并完\\
+          成binding后, 后续就不需要在处理skb时再次查询nat规则表了.
+        + 根据ctinfo分别进行处理(对我们的case, 当前为: =IP_CT_NEW=)
+        + =IP_CT_NEW= 处理\\
+          检查ct是否已经由nat initialized: =ct->status= 是否设置\\
+          =IPS_SRC_NAT_DONE(SNAT)= 或者设置 =IPS_DST_NAT_DONE(DNAT)=\\
+          如果没有initialized, 那么调用 =nf_nat_initialized= 进行初始化,\\
+          完成初始化后,接下来需要根据iptable设置的规则再次初始化\\
+          =nf_conn= 的ext(nat)信息, 迭代处理各个match, 然后调用相应的\\
+          target函数(target函数都调用 =nf_nat_setup_info= 完成对\\
+          =nf_conn= 的修改), 完成该功能的函数为参数 =do_chain(iptable_nat_do_chain)=\\
+          如果ct还未完成初始化, 那么调用 =nf_nat_alloc_null_binding=\\
+          构建一个新的 =nf_nat_range= 结构, 然后调用\\
+          =nf_nat_setup_info= 完成nat初始化, 如果ct初始化完成, 那么直\\
+          接返回调用到 =nf_nat_packet= , 这个函数根据需要完成对报文的\\
+          修正. 此时: =ct->status= 被设置为 =IPS_DST_NAT_DONE= 表示完\\
+          成了 =pre-routeing= 阶段的tuple校正.\\
+        + 最后调用 =nf_nat_packet= \\
+          该函数中完成对包的修改: 先调用 =l3proto->manip_pkt=, 3层协议\\
+          回调里面在调用l4proto的 =manip_pkt=, 通过两个回调完成对报文的\\
+          重新修正.\\
+          对于我们的场景: 当前的mtype为: =IPS_DST_NAT=, 在prerouting阶\\
+          段, 并没有设置规则, 那么不进行任何操作,直接NF_ACCEPT, 退出处理.\\
+
+  2. 当第一个封包经过(=NF_INET_POST_ROUTING=):\\
+     当封包通过上述的步骤1, 然后查找路由进行转发, 最后到达\\
+     =post_routing= 这个hook点, 下面说明这个hook点需要做的工作.\\
+     需要注意的是在这点上, =nat hookcallback= 的优先级大于conntrack\\
+     hookcallback的优先级, 所以nat callback先执行然后在执行conntrack callback.
+     1) =iptable_nat_ipv4_out= 处理\\
+        =iptable_nat_ipv4_out= 调用 =nf_nat_ipv4_out= -> =nf_nat_ipv4_fn=\\
+        完成处理, 对于SNAT和DNAT, hook callback 最后都汇总到\\
+        =nf_nat_ipv4_fn= 进行处理. 上面已经经过了说明, 下面针对post\\
+        routing(SNAT)的场景再次详细说明如下:
+        + 转换得到maniptype(SNAT)
+        + 检查是否是分片包
+        + 得到ct(=nf_conn=)
+        + 检查skb是否被tracked, 如果没有被tracked, 返回 =NF_ACCEPT=
+        + 从ct得到nat(=nf_conn_nat=)
+        + 根据ctinfo分别进行处理:
+          - =IP_CT_NEW=:\\
+            在 =pre-routing= 阶段, conntrack已经对包做了conntrack, 此外,\\
+            在我们这块的场景中并没有设置DNAT规则, 所以 =pre-routing= 阶\\
+            段nat模块并不会修改ct的状态, 所以处理到达这块的时候,\\
+            ctinfo状态是 =IP_CT_NEW=.\\
+            首先通过 =nf_nat_initialized= 判断ct是否初始化, 当然此处还\\
+            未初始化, 于是调用 =do_chain(iptable_nat_do_chain)= 进行规则\\
+            match和target处理, 然后在才判断是否完成初始化:\\
+            如果 =iptable_nat_do_chain= 没有将 =ct->status= 置位, 那么调用\\
+            =nf_nat_alloc_null_binding= 完成绑定, 最终会将\\
+            : ct->status |= IPS_SRC_NAT_DONE=;
+            此外 还有一个特别重要的地方就是 在 =nf_nat_setup_info= 中还会设置:
+            : ct->status |= IPS_SRC_NAT;
+            这样, 在replay包到达 =pre-routing= 时就根据该标志直接dnat
+            了, 见代码:
+            #+BEGIN_SRC c
+            /* Invert if this is reply dir. */
+            if (dir == IP_CT_DIR_REPLY)   //dir为 IP_CT_DIR_REPLY
+            	statusbit ^= IPS_NAT_MASK;// statusbit = IPS_SRC_NAT
+
+            /* Non-atomic: these bits don't change. */
+            if (ct->status & statusbit) { // 条件满足, 直接修正报文.
+		/* We are aiming to look like inverse of other direction. */
+		nf_ct_invert_tuplepr(&target, &ct->tuplehash[!dir].tuple);
+
+		l3proto = __nf_nat_l3proto_find(target.src.l3num);
+		l4proto = __nf_nat_l4proto_find(target.src.l3num,
+						target.dst.protonum);
+		if (!l3proto->manip_pkt(skb, 0, l4proto, &target, mtype))
+			return NF_DROP;
+	    }
+            #+END_SRC
+          - =IP_CT_RELATED/IP_CT_RELATED_REPLY=
+            这是跟helper及其except connection机制有关, 后续在说.
+          - default:
+            表示status状态已经为 established, 继续往下执行.
+        + =nf_nat_packet= 处理\\
+          该函数中完成对包的修改: 先调用 =l3proto->manip_pkt=, 3层协议\\
+          回调里面在调用l4proto的 =manip_pkt=, 通过两个回调完成对报文的\\
+          重新修正.\\
+          对于我们的场景: 当前的mtype为: =IPS_SRC_NAT=, 在 =post-routing= 阶\\
+          段, 我们设置了snat规则, ct->status已经绑定了\\
+          =IPS_SRC_NAT_DONE=, 所以要完成出口数据包文的修正. 具体操作如下:\\
+          首先: 通过 =nf_ct_invert_tuplepr(&target,&ct->tuplehash[!dir].tuple)= 得到\\
+          一个target tuple, 注意: 举例说明这个tuple实际如下:
+          |-------------------+-------+-------------------+-------+-------------------------------------|
+          | sip               | sport | dip               | dport |                                     |
+          |-------------------+-------+-------------------+-------+-------------------------------------|
+          | =192.168.0.2=     | =100= | =113.113.113.113= | =80=  | =ct->tuplehash[IP_CT_DIR_ORIGINAL]= |
+          | =113.113.113.113= | =80=  | =192.168.0.2=     | =100= | =ct->tuplehash[IP_CT_DIR_REPLY]=    |
+          | =113.113.113.113= | =80=  | =111.111.111.111= | =200= | =ct->tuplehash[IP_CT_DIR_REPLY]=    |
+          | =111.111.111.111= | =200= | =113.113.113.113= | =80=  | =target=                            |
+          |-------------------+-------+-------------------+-------+-------------------------------------|
+          如上表所示, 转换出这个target是因为在\\
+          =l3proto->manip_pkt(..., &target,...)= 中, 该target需要作为参\\
+          数传入, 并以该target对skb进行snat操作修正.
+     2) conntrack: =ipv4_helper= 处理\\
+        通过 =nfct_help(ct)= 获取 =nf_conn_help=, 如果有helper, 调用\\
+        helper->help对包进行处理.\\
+     3) conntrack: =ipv4_confirm= 处理\\
+        该函数是 =nf_conntrack_confirm= wrapper函数.\\
+        在 =nf_conntrack_confirm= wrapper 中检查ct是否confirm的, 如果没有\\
+        调用 =__nf_conntrack_confirm= 完成ct的confirm, 具体就是调用\\
+        =__nf_conntrack_hash_insert(ct, hash, reply_hash)=; 将ct插入hash表.\\
+        同时在该阶段将ct状态修改为:\\
+        : ct->status |= IPS_CONFIRMED\\
+
+  3. 当收到第一个封包的replay封包时(=NF_INET_PRE_ROUTING=):
+     1) =ipv4_conntrack_in= 处理:\\
+        =ipv4_conntrack_in= 是 =nf_conntrack_in= 的包裹函数, 该函数的\\
+        实现流程在前面 [[*%3Dipv4_conntrack_in%3D][=ipv4_conntrack_in= ]]已经描述了, 下面说明在对于\\
+        replay报文, 该函数的处理不同之处.\\
+        对于 =reply= 报文, 在此刻还没有被 =conntrack=,通过\\
+        =resolve_normal_ct= 可以查到ct, 因为在对收到的第一个报文在\\
+        postrouting阶段处理的时候已经将ct插入到hash表中了. 然后调用l4proto的\\
+        packet(=udp_packet=)完成此时该报文在prerouting阶段conntrack的\\
+        处理处理. 此时修改的关键变量有:
+        : nfctinfo = IP_CT_ESTABLISHED
+        : ct->status |= IPS_SEEN_REPLY_BIT
+
+     2) =iptable_nat_ipv4_in=
+        : nf_nat_ipv4_fn -> nf_nat_packet
+        在 =nf_nat_packet= 中完成对报文的dnat修正.
+
+  4. 当输出该replay封包时(=NF_INET_POST_ROUTING=)
+     1) =nat: iptable_nat_ipv4_out=
+        : nf_nat_ipv4_out -> nf_nat_ipv4_fn -> nf_nat_packet
+        : statusbit = IPS_DST_NAT
+        报文已经完成修正, 此时不需要任何处理.
+     2) =conntrack: ipv4_confirm/ipv4_helper=
+     3) 报文递交给 =ip_finish_output= 完成处理.
