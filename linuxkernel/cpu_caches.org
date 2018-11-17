@@ -3,11 +3,9 @@
 #+EMAIL:  barrylgx@163.com
 #+DESCRIPTION:
 #+KEYWORDS:
-#+LANGUAGE: cn
-#+OPTIONS: ^:{}
-#+OPTIONS: H:4 num:t toc:t \n:t @:t ::t |:t ^:t -:t f:t *:t <:t ^:nil
+#+LANGUAGE: en
+#+OPTIONS: \n:t
 #+HTML_HEAD: <link rel="stylesheet" type="text/css" href="../orgstyle.css"/>
-
 
 本文是看了 [[http://duartes.org/gustavo/blog/post/intel-cpu-caches/][interl-cpu-caches]] 后的总结
 
