@@ -3,22 +3,22 @@
 #+EMAIL:  barrylgx@163.com
 #+DESCRIPTION:
 #+KEYWORDS:
-#+LANGUAGE:  cn
+#+LANGUAGE: cn
 #+OPTIONS: ^:{}
-#+OPTIONS:   H:4 num:t toc:t \n:t @:t ::t |:t ^:t -:t f:t *:t <:t
-#+OPTIONS: ^:nil
-#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="orgstyle.css"/>
+#+OPTIONS: H:4 num:t toc:t \n:t @:t ::t |:t ^:t -:t f:t *:t <:t ^:nil
+#+HTML_HEAD: <link rel="stylesheet" type="text/css" href="../orgstyle.css"/>
+
 
 本文是看了 [[http://duartes.org/gustavo/blog/post/intel-cpu-caches/][interl-cpu-caches]] 后的总结
 
 * 为什么要有L1cache, L2cahce...？
   因为cpu自身执行速度与ddr的访问速度不匹配， 如果不加cache， 那么cpu
   需要数据时只能hold。 增加cache是提高cpu的使用效率。
-  一个形象的比喻： \\
-  L1cache： 你从眼前的办公桌上拿起几页打印纸； \\
-  L2cache： 你从办公桌下面的抽屉中拿出几本书； \\
-  DDR：     你跑去图书馆借了很多本书； \\
-  各个组件的速度比较: \\
+  一个形象的比喻：
+  L1cache： 你从眼前的办公桌上拿起几页打印纸；
+  L2cache： 你从办公桌下面的抽屉中拿出几本书；
+  DDR：     你跑去图书馆借了很多本书；
+  各个组件的速度比较:
   |-------------+------------------------------------------------------------|
   | components  | cycles/ns                                                  |
   |-------------+------------------------------------------------------------|
@@ -32,15 +32,15 @@
 
 
 * cache如何组织？
-  举例: 8-way set associate, 64bytes cache lines; \\
-  cache是通过将物理地址进行拆分后按照行列进行索引的。 \\
-  set: 就是row； \\
-  way: 就是column; \\
-  每一行可以有多个way; 每个way有一个cache-line； 一个cache-line有2的幂次方的字节数； \\
+  举例: 8-way set associate, 64bytes cache lines;
+  cache是通过将物理地址进行拆分后按照行列进行索引的。
+  set: 就是row；
+  way: 就是column;
+  每一行可以有多个way; 每个way有一个cache-line； 一个cache-line有2的幂次方的字节数；
 
 
 * 如何从物理地址抽取 set-index?
-  一般从物理地址的低位的12bit中抽取。 \\
+  一般从物理地址的低位的12bit中抽取。
   如果mmu管理单元的page大小为4k； 每个cache-line大小为64bytes； 那么
   如果将一个page均匀装入所有的set，那么需要的set为： 4k/64 = 64set；
   那么set-index在物理地址中占用 6 个bit；
