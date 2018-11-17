@@ -1,0 +1,65 @@
+#+TITLE: compile & link
+#+AUTHOR: barrylgx
+#+EMAIL:  barrylgx@163.com
+#+DESCRIPTION:
+#+KEYWORDS:
+#+LANGUAGE: en
+#+OPTIONS:  H:4 num:t toc:t \n:nil @:t ::t |:t ^:t -:t f:t *:t <:t ^:{} ^:nil
+
+* gcc compiler
+  + -fomit-frame-pointer
+    不使用任何帧指针， 而是通过esp直接计算帧上变量的位置。这么做的好处
+    是可以多出一个ebp寄存器供使用，但是坏处很多，比如帧上的寻址速度会
+    变慢，而且无法准确定位函数的调用轨迹；
+  + __attribute__((regparm(0))
+    : asmlinkage pid_t sys_fork(void);
+    : define asmlinkage __attribute__((regparm(0))
+    这个扩展关键字的意义是让这个函数只从栈上获取参数。 因为gcc对普通函
+    数有优化措施，会使用寄存器来传递参数；内核里面在实现系统调用时需要
+    这么操作；
+
+* 参数如何传递？
+  1. 分析如下：
+     #+BEGIN_SRC c
+    int add(int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8)
+    {
+        int sum = a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8;
+        sum = sum + 0xaa;
+        return sum;
+    }
+     #+END_SRC
+
+  #+BEGIN_SRC asm
+    0000000000000000 <add>:
+       0:   55                      push   %rbp             ; push the caller's rbp to the stack
+       1:   48 89 e5                mov    %rsp,%rbp        ; rbp pointe the current rsp
+       4:   89 7d ec                mov    %edi,-0x14(%rbp) ; the 1st argument saved in edi, push on the stack
+       7:   89 75 e8                mov    %esi,-0x18(%rbp) ; the 2nd argument saved in esi, push on the stack
+       a:   89 55 e4                mov    %edx,-0x1c(%rbp) ; ...
+       d:   89 4d e0                mov    %ecx,-0x20(%rbp) ; ...
+      10:   44 89 45 dc             mov    %r8d,-0x24(%rbp) ; ...
+      14:   44 89 4d d8             mov    %r9d,-0x28(%rbp) ; ...
+      18:   8b 55 ec                mov    -0x14(%rbp),%edx
+      1b:   8b 45 e8                mov    -0x18(%rbp),%eax
+      1e:   01 c2                   add    %eax,%edx        ; edx save the sum of 1st and 2nd arguments
+      20:   8b 45 e4                mov    -0x1c(%rbp),%eax
+      23:   01 c2                   add    %eax,%edx
+      25:   8b 45 e0                mov    -0x20(%rbp),%eax
+      28:   01 c2                   add    %eax,%edx
+      2a:   8b 45 dc                mov    -0x24(%rbp),%eax
+      2d:   01 c2                   add    %eax,%edx
+      2f:   8b 45 d8                mov    -0x28(%rbp),%eax
+      32:   01 c2                   add    %eax,%edx
+      34:   8b 45 10                mov    0x10(%rbp),%eax ; fetch the 7st argument from caller's stack, indexed by ebp+0x10
+      37:   01 c2                   add    %eax,%edx
+      39:   8b 45 18                mov    0x18(%rbp),%eax ; fetch the 8th argument from caller's stack, indexed by ebp+0x18
+      3c:   01 d0                   add    %edx,%eax
+      3e:   89 45 fc                mov    %eax,-0x4(%rbp) ; store the sum into the stack offset of rbp 4bytes
+      41:   81 45 fc aa 00 00 00    addl   $0xaa,-0x4(%rbp)
+      48:   8b 45 fc                mov    -0x4(%rbp),%eax ; return value saved in eax
+      4b:   5d                      pop    %rbp            ; restore the caller's rbp
+      4c:   c3                      retq                   ; return to the caller
+  #+END_SRC
+
+  2. 系统调用参数传递
+    : ebx/ecx/edx/esi/edi/ebp

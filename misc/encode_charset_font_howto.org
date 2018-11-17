@@ -1,0 +1,31 @@
+#+TITLE: charset & font & encode
+#+AUTHOR: barrylgx
+#+EMAIL:  barrylgx@163.com
+#+DESCRIPTION:
+#+KEYWORDS:
+#+LANGUAGE: en
+#+OPTIONS:  H:4 num:t toc:t \n:nil @:t ::t |:t ^:t -:t f:t *:t <:t ^:{} ^:nil
+
+* references
+  http://ergoemacs.org/emacs/unicode_basics.html
+
+
+* encodeing system?
+  编码系统，就是针对收集到的字符集做一个统一的编码（code point）这样方
+  便计算机进程存储，因为计算机存储的只是二进制；
+
+
+* charset?
+  字符集，就是把所有的字符符号收集在一起，组成一个集合；
+
+
+* font
+  存在在计算机中的二进制文件怎么解释呢？
+  那就是fontset，fontset建立了code point与字符像素（就是肉眼看到的）的
+  映射关系；
+
+
+* 当计算机打开一个文件时？
+  文档编辑器会选择一个encodeing system（可以认为指定，也可以是计算器自
+  己猜）对二进制进行解释，然后根据系统配置的font字体进行显示；这样就最
+  终看到了人类可以阅读的一个一个符号；

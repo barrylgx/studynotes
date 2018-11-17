@@ -1,0 +1,90 @@
+#+TITLE: make & makefile
+#+AUTHOR: barrylgx
+#+EMAIL:  barrylgx@163.com
+#+DESCRIPTION:
+#+KEYWORDS:
+#+LANGUAGE: en
+#+OPTIONS:  H:4 num:t toc:t \n:nil @:t ::t |:t ^:t -:t f:t *:t <:t ^:{} ^:nil
+
+
+* questions
+ 1. 伪目标是什么？
+    + make工具的目的是build出一个最终的文件，所以真正的目标是文件，那
+      么对应的伪目标就是非文件的目标，那就是说虽然是一个目标，但是不会
+      产生文件；
+    + 在makefile中没有依赖的目标就是一个伪目标，因为其没有依赖，make无
+      法决定是否要执行，所以只能显示的指明这个目标才能执行该伪目标的规
+      则；使用特殊标记：
+    : .PHONY clean
+    这样就将clean这个目标显式指定为一个伪目标；
+ 2. 为什么要有伪目标的设计？
+    1) 不带依赖的伪目标为我们提供了一种显式执行目标规则的一种方式；
+    2) 带依赖的伪目标（依赖为真目标）可以帮助我们一次性生成多个真目标；
+ 3. 操作符
+    : v1 = $(v2)
+    上面这个操作中，变量是在什么时候扩展的呢？
+    make指定了几种不同的扩展方式：
+    1) = 在执行时扩展
+    2) := 在定义时扩展
+    3) ?= 只有在该变量为空时才设置值
+    4) += 将值追加到变量的尾端
+ 4. 变量
+    make有内置变量，自动变量，和自定义变量
+ 5. 有那些自动变量？
+    |----+-----------------------------------------|
+    | $@ | target set                              |
+    | $< | the first prerequisites                 |
+    | $? | the prerequisites set with newer target |
+    | $^ | all prerequisites                       |
+    | $* | the string matched % matched            |
+    |----+-----------------------------------------|
+ 6. 函数
+    函数调用方法:
+    $(function arguments) 或者 ${function arguments}
+    函数的返回值可以赋值给变量；
+
+    1) shell
+       : src := $(shell find ./ -iname "*.[chs]" -type f -print)
+    2) wildcard
+       : src := $(wildcard src/*.c)
+    3) subst
+       : $(subst from,to,text)
+       #+BEGIN_SRC makefile
+         comma:= ,
+         empty:=
+         # space变量用两个空变量作为标识符，当中是一个空格
+         space:= $(empty) $(empty)
+         foo:= a b c
+         bar:= $(subst $(space),$(comma),$(foo))
+         # bar is now `a,b,c'.
+       #+END_SRC
+    4) patsubst
+       : $(patsubst pattern,replacement,text)
+    5) replace subffix
+       #+BEGIN_SRC makefile
+         min: $(OUTPUT:.js=.min.js)
+         # 上面代码的意思是，将变量OUTPUT中的后缀名 .js 全部替换成 .min.js
+       #+END_SRC
+
+
+* examples
+  1. 如何自动处理文件dep？
+     #+BEGIN_SRC makefile
+       comma = ,
+       depfile    = $(subst $(comma),_,$(dir $@).$(notdir $@).d)
+       DEPS      := $(foreach obj,$(objs),$(subst $(comma),_,$(dir $(obj)).$(notdir $(obj)).d))
+       CFLAGS    := -I./include
+
+       # -Wp,-MD: 告诉编译器生成.o的同时生成对应的.d文件，文件名字由$defile；
+       # -Wp,-MMD:告诉编译器生成.o的同时生成对应的.d文件，但是.d文件中不包括系统标准头文件的依赖；
+       # -Wp,MT:  告诉编译器，在生成的依赖文件中，指定依赖规则的目标，这样对于makefile来说才是一个完整的依赖表达；
+       c_flags = -Wp,-MD,$(depfile) -Wp,-MT,$@ $(CFLAGS)
+
+       %.o:%.c
+               $(E) "  CC      " $@
+               $(Q) $(CC) $(c_flags) -c  $< -o $@
+
+       ifneq ($(MAKECMDGOALS),clean)
+       -include $(DEPS)
+       endif
+     #+END_SRC
